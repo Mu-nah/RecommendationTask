@@ -1,12 +1,302 @@
+Take-Home Assignment – ONYEBUKWA HILARY MUNACHISO
+
+Engagement score Design 
+Formula (high-level)
+For each event on a ping, I assigned an event-level score and then aggregate per (user, ping).
+•	view contributes: 1.0 * watch_time_ratio where watch_time_ratio = watch_time_sec / duration_sec. (So full watch ~1.0, half watch ~0.5.)
+•	like contributes +2.0
+•	comment contributes +3.0
+•	share contributes +4.0
+•	follow_creator contributes +2.0
+•	impression contributes +0.1 (very weak signal)
+Per (user, ping) engagement score = sum of all event-scores from that user for that ping.
+Global ping score = sum of (user,ping) engagement scores across all users.
+Rationale 
+Views are a core engagement signal but must be scaled by how much of the video was actually watched — so we use watch_time_ratio. Stronger actions (comment, share) indicate higher intent and should be weighted heavier than likes. Impressions are weak signals and only give a tiny positive contribution (to avoid zeroing out cold-start items). Follow-creator is a strong signal for creator affinity and gets a moderate boost.
+
+Python (pandas) code — full pipeline
+This single script:
+•	reads users.csv, pings.csv, interactions.csv,
+•	cleans/pads missing durations if needed,
+•	computes watch_time_ratio, event-level event_score, per (user, ping) engagement, global ping score,
+•	prints/saves top-10 pings, watch_time_ratio distribution, new-vs-existing summary,
+•	builds a simple heuristic recommender and outputs Top-10 for 3 example users
+#pingtop_recs.py 
+import os
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+
+# ---------- CONFIG ----------
+INTERACTIONS_CSV = "interactions.csv"   # columns: user_id,ping_id,event_type,watch_time_sec,event_timestamp
+PINGS_CSV = "pings.csv"                # columns: ping_id,creator_id,main_hashtag,category,duration_sec,created_at
+USERS_CSV = "users.csv"                # columns: user_id,country,signup_date,age
+OUT_DIR = "./output"
+EXAMPLE_USERS = ["u1","u2","u3"]       # change as needed
+
+# ---------- helpers ----------
+def load_csv(path):
+    return pd.read_csv(path)
+
+# ---------- load data ----------
+inter = load_csv(INTERACTIONS_CSV)
+pings = load_csv(PINGS_CSV)
+users = load_csv(USERS_CSV)
+
+# normalize column names (flexible)
+inter.columns = inter.columns.str.strip().str.lower()
+pings.columns = pings.columns.str.strip().str.lower()
+users.columns = users.columns.str.strip().str.lower()
+
+# column names handling
+# interactions: user_id, ping_id, event_type, watch_time_sec, event_timestamp
+# pings: ping_id / oping_id, creator_id / ocreator_id, main_hashtag / omain_hashtag, category / ocategory, duration_sec / oduration_sec, created_at / ocreated_at
+# users: user_id / ouser_id, signup_date / osignup_date
+
+# make column name canonical mapping (scalable measures)
+def canonicalize(df, mapping):
+    df = df.rename(columns={k:v for k,v in mapping.items() if k in df.columns})
+    return df
+
+inter = canonicalize(inter, {
+    'ouser_id':'user_id','ouser_id':'user_id',
+    'oping_id':'ping_id'
+})
+pings = canonicalize(pings, {
+    'oping_id':'ping_id','ocreator_id':'creator_id','omain_hashtag':'main_hashtag','ocategory':'category','oduration_sec':'duration_sec','ocreated_at':'created_at'
+})
+users = canonicalize(users, {
+    'ouser_id':'user_id','osignup_date':'signup_date'
+})
+
+# parse timestamps
+if 'event_timestamp' in inter.columns:
+    inter['event_timestamp'] = pd.to_datetime(inter['event_timestamp'], errors='coerce')
+if 'created_at' in pings.columns:
+    pings['created_at'] = pd.to_datetime(pings['created_at'], errors='coerce')
+if 'signup_date' in users.columns:
+    users['signup_date'] = pd.to_datetime(users['signup_date'], errors='coerce')
+
+# fallback: if ping durations missing, fill with median or default 30s (scalable measures)
+if 'duration_sec' not in pings.columns or pings['duration_sec'].isna().all():
+    pings['duration_sec'] = 30
+else:
+    pings['duration_sec'] = pings['duration_sec'].fillna(pings['duration_sec'].median())
+
+# ensure string ids
+inter['ping_id'] = inter['ping_id'].astype(str)
+inter['user_id'] = inter['user_id'].astype(str)
+pings['ping_id'] = pings['ping_id'].astype(str)
+users['user_id'] = users['user_id'].astype(str)
+
+# ------------ Engagement computation -------------
+# compute watch_time_ratio for view events
+inter['watch_time_sec'] = inter.get('watch_time_sec', 0).fillna(0).astype(float)
+inter = inter.merge(pings[['ping_id','duration_sec']], on='ping_id', how='left')
+inter['duration_sec'] = inter['duration_sec'].fillna(30)
+inter['watch_time_ratio'] = np.where(inter['event_type']=='view', inter['watch_time_sec'] / inter['duration_sec'], np.nan)
+
+# event weights
+weights = {
+    'view': 1.0,           # multiplied by watch_time_ratio
+    'like': 2.0,
+    'comment': 3.0,
+    'share': 4.0,
+    'follow_creator': 2.0,
+    'impression': 0.1
+}
+
+def event_score(row):
+    et = row['event_type']
+    if et == 'view':
+        r = row['watch_time_ratio'] if not pd.isna(row['watch_time_ratio']) else 0.0
+        return weights['view'] * r
+    return weights.get(et, 0.0)
+
+inter['event_score'] = inter.apply(event_score, axis=1)
+
+# aggregate per (user,ping)
+user_ping = inter.groupby(['user_id','ping_id'], as_index=False).agg(
+    engagement_score=('event_score','sum'),
+    last_ts=('event_timestamp','max'),
+    n_events=('event_type','count')
+)
+
+# global ping score
+ping_global = user_ping.groupby('ping_id', as_index=False).agg(
+    global_engagement=('engagement_score','sum'),
+    users_interacted=('user_id','nunique')
+).sort_values('global_engagement', ascending=False)
+
+# save results
+
+os.makedirs(OUT_DIR, exist_ok=True)
+ping_global.to_csv(os.path.join(OUT_DIR,'ping_global.csv'), index=False)
+user_ping.to_csv(os.path.join(OUT_DIR,'user_ping.csv'), index=False)
+
+# ------------ Metrics asked ------------
+# distribution of watch_time_ratio (only view events)
+views = inter[inter['event_type']=='view'].copy()
+wtr_stats = views['watch_time_ratio'].describe(percentiles=[0.25,0.5,0.75,0.9])
+wtr_stats.to_csv(os.path.join(OUT_DIR,'watch_time_ratio_stats.csv'))
+
+# top 10 pings by global engagement
+top10 = ping_global.merge(pings, on='ping_id', how='left').head(10)
+top10.to_csv(os.path.join(OUT_DIR,'top10_pings.csv'), index=False)
+
+# compare new users vs existing users
+if 'signup_date' in users.columns:
+    max_signup = users['signup_date'].max()
+    cutoff = max_signup - pd.Timedelta(days=7)
+    users['is_new'] = users['signup_date'] >= cutoff
+else:
+    users['is_new'] = False
+
+inter_u = inter.merge(users[['user_id','is_new']], on='user_id', how='left')
+
+avg_watch_by_group = inter_u[inter_u['event_type']=='view'].groupby('is_new').agg(avg_watch_time_ratio=('watch_time_ratio','mean'), view_count=('watch_time_ratio','count')).reset_index()
+avg_watch_by_group.to_csv(os.path.join(OUT_DIR,'avg_watch_by_group.csv'), index=False)
+
+# average number of pings interacted (view/like/comment/share) per user
+valid = inter[inter['event_type'].isin(['view','like','comment','share'])]
+pings_per_user = valid.groupby('user_id')['ping_id'].nunique().reset_index(name='n_pings')
+pings_per_user = pings_per_user.merge(users[['user_id','is_new']], on='user_id', how='right').fillna({'n_pings':0})
+avg_pings_by_group = pings_per_user.groupby('is_new').agg(avg_pings=('n_pings','mean'), user_count=('user_id','count')).reset_index()
+avg_pings_by_group.to_csv(os.path.join(OUT_DIR,'avg_pings_by_group.csv'), index=False)
+
+# ------------ Short interpretation (3-6 bullets) ------------
+# I'll print these in final report (noting them here for reference)
+
+# ------------ Simple recommender (heuristic) ------------
+# Build item features: global_popularity (normalized), category, hashtag, creator, freshness
+items = pings.copy().rename(columns={'ping_id':'ping_id'})
+items['global_pop'] = items['ping_id'].map(ping_global.set_index('ping_id')['global_engagement']).fillna(0.0)
+if items['global_pop'].max() > items['global_pop'].min():
+    items['global_pop_norm'] = (items['global_pop'] - items['global_pop'].min()) / (items['global_pop'].max() - items['global_pop'].min())
+else:
+    items['global_pop_norm'] = 0.0
+items['created_at'] = pd.to_datetime(items.get('created_at'))
+now = items['created_at'].max() if items['created_at'].notna().any() else pd.to_datetime('2024-02-20')
+items['age_days'] = (now - items['created_at']).dt.days.fillna(30)
+items['freshness'] = 1 / (1 + items['age_days'])
+
+# user affinity features
+int_meta = inter.merge(items[['ping_id','category','main_hashtag','creator_id']], on='ping_id', how='left')
+user_cat = int_meta.groupby(['user_id','category']).size().reset_index(name='count')
+user_total = int_meta.groupby('user_id').size().reset_index(name='total')
+user_cat = user_cat.merge(user_total, on='user_id')
+user_cat['cat_affinity'] = user_cat['count'] / user_cat['total']
+
+user_creator = int_meta.groupby(['user_id','creator_id']).size().reset_index(name='count')
+user_creator = user_creator.merge(user_total, on='user_id')
+user_creator['creator_affinity'] = user_creator['count'] / user_creator['total']
+
+# scoring function
+def recommend_for_user(uid, topk=10, alpha=0.5, beta=0.25, gamma=0.15, delta=0.10):
+    df = items.copy()
+    ucat = user_cat[user_cat['user_id']==uid].set_index('category')['cat_affinity'].to_dict() if not user_cat.empty else {}
+    ucre = user_creator[user_creator['user_id']==uid].set_index('creator_id')['creator_affinity'].to_dict() if not user_creator.empty else {}
+    df['user_cat_aff'] = df['category'].map(ucat).fillna(0.0)
+    df['user_cre_aff'] = df['creator_id'].map(ucre).fillna(0.0)
+    df['score'] = alpha * df['global_pop_norm'] + beta * df['user_cat_aff'] + gamma * df['user_cre_aff'] + delta * df['freshness']
+    # exclude items user already interacted with
+    seen = inter[inter['user_id']==uid]['ping_id'].unique().tolist()
+    df = df[~df['ping_id'].isin(seen)]
+    df = df.sort_values('score', ascending=False).head(topk)
+    # add reason column
+    reasons=[]
+    for _, r in df.iterrows():
+        parts=[]
+        if r['user_cat_aff']>0: parts.append(f"prefers cat={r['category']}")
+        if r['user_cre_aff']>0: parts.append("engaged this creator")
+        if r['global_pop_norm']>0.5: parts.append("globally popular")
+        if r['freshness']>0.02: parts.append("recent")
+        reasons.append("; ".join(parts) if parts else "popular/new")
+    df['reason'] = reasons
+    return df[['ping_id','score','category','main_hashtag','creator_id','reason']]
+
+# produce recommendations for example users
+os.makedirs(os.path.join(OUT_DIR,'recs'), exist_ok=True)
+for uid in EXAMPLE_USERS:
+    recs = recommend_for_user(uid, topk=10)
+    recs.to_csv(os.path.join(OUT_DIR,'recs', f'recs_{uid}.csv'), index=False)
+
+print("Done. Outputs in:", OUT_DIR)
+
+
+the output directory will contain:
+•	ping_global.csv (global engagement per ping),
+•	user_ping.csv (per-user/ping engagement),
+•	top10_pings.csv,
+•	watch_time_ratio_stats.csv,
+•	avg_watch_by_group.csv,
+•	avg_pings_by_group.csv,
+•	recs/ with recs_u1.csv…..
+what the metrics will tell you
 •	Many view events have low watch_time_ratio (median often < 0.5) — suggests frequent skims/swipes; prioritize short hooks or higher early retention.
 •	Items with high global engagement frequently combine many partial/full views and some likes/shares; shares/comments are rare but amplify item score.
 •	New users (signed up in last 7 days) typically have lower absolute number of interactions but sometimes higher watch ratios (onboarding or novelty effect) — consider showing more engaging/popular content early.
 •	If impressions dominate (lots of impressions, few views), feed freshness and strong thumbnails might help lift view rates.
 •	Creator-follow events are valuable signals for personalized ranking (use to bias towards that creator’s content).
+Recommendation Prototype — logic + why
+Approach chosen: Heuristic ranking (simple linear combination).
+Score = α * global_popularity + β * user_category_affinity + γ * user_creator_affinity + δ * freshness.
+•	global_popularity = normalized global engagement (fast, low-cost).
+•	user_category_affinity = fraction of a user's historical interactions that hit that category.
+•	user_creator_affinity = same for creator.
+•	freshness = simple inverse of age-in-days (encourages recent content).
+
+Why: Simple, explainable, cheap to compute, parallelizable, good baseline for warm-start and A/B tests before investing/ before transitioning to more advanced models such as Youtube two tower, XGBoost, LightGBM, or transformer-based architectures
+Feature building notes:
+•	Compute affinities from last N days (sliding window) to capture shifting tastes.
+•	Normalize features to [0,1].
+Example Top-10 output format
+Below are the Top-10 lists for three users in the requested CSV-like format (these match sample output).
+User_1 Recommendations
+ping_id	score	category	main_hashtag	creator_id	reason
+p20	0.5818025967477625	education	travel	u14	prefers cat=education; engaged this creator; globally popular; recent
+p25	0.5285873356023362	beauty	makeup	u11	prefers cat=beauty; globally popular; recent
+p7	0.5009713293275627	travel	music	u8	globally popular; recent
+p29	0.49985953791575877	dance	food	u19	prefers cat=dance; globally popular; recent
+p32	0.44234448549335725	comedy	pets	u7	globally popular; recent
+p36	0.43954578900618263	dance	music	u17	prefers cat=dance; engaged this creator; globally popular; recent
+p17	0.41814190219903286	travel	comedy	u17	engaged this creator; globally popular; recent
+p13	0.36826325369294877	food	makeup	u18	engaged this creator; globally popular; recent
+p33	0.36046863524488626	dance	fitness	u16	prefers cat=dance; globally popular; recent
+p1	0.34329027930345213	education	football	u3	prefers cat=education; globally popular; recent
+
+
+User_2 Recommendations
+ping_id	score	category	main_hashtag	creator_id	reason
+p30	0.5303472222222222	gaming	pets	u14	engaged this creator; globally popular; recent
+p25	0.5098373356023362	beauty	makeup	u11	prefers cat=beauty; globally popular; recent
+p32	0.47359448549335725	comedy	pets	u7	prefers cat=comedy; globally popular; recent
+p29	0.4561095379157588	dance	food	u19	prefers cat=dance; engaged this creator; globally popular; recent
+p26	0.3670357648080452	travel	travel	u5	prefers cat=travel; globally popular; recent
+p1	0.35579027930345214	education	football	u3	prefers cat=education; globally popular; recent
+p18	0.33008250346653223	travel	pets	u4	prefers cat=travel; globally popular; recent
+p31	0.32530977442029374	comedy	music	u5	prefers cat=comedy; globally popular; recent
+p33	0.3167186352448863	dance	fitness	u16	prefers cat=dance; engaged this creator; globally popular; recent
+p28	0.29216389208546306	travel	makeup	u6	prefers cat=travel; recent
 
 
 
- Short note on metrics & trade-offs
+
+User_3 Recommendations
+ping_id	score	category	main_hashtag	creator_id	    reason
+p20	0.5941102890554548	education	travel	u14	prefers cat=education; engaged this creator; globally popular; recent
+p7	0.5509713293275628	travel	music	u8	prefers cat=travel; engaged this creator; globally popular; recent
+p25	0.5170488740638747	beauty	makeup	u11	prefers cat=beauty; globally popular; recent
+p32	0.4808060239548957	comedy	pets	u7	prefers cat=comedy; globally popular; recent
+p29	0.44985953791575883	dance	food	u19	prefers cat=dance; engaged this creator; globally popular; recent
+p17	0.4381419021990328	travel	comedy	u17	prefers cat=travel; engaged this creator; globally popular; recent
+p36	0.3595457890061826	dance	music	u17	prefers cat=dance; engaged this creator; globally popular; recent
+p26	0.34299730326958366	travel	travel	u5	prefers cat=travel; globally popular; recent
+p13	0.33903248446217954	food	makeup	u18	prefers cat=food; engaged this creator; globally popular; recent
+p31	0.3325213128818322	comedy	music	u5	prefers cat=comedy; globally popular; recent
+
+
+Evaluation 
 Primary offline metrics
 •	HitRate@K (Recall@K) — fraction of users for whom Top-K contains an item they actually had a high-engagement event on (view with watch_time_ratio>=0.5, like, share, comment) in the test window. Easy to compute and interpretable.
 •	NDCG@K — uses graded relevance (e.g., share=4, comment=3, like=2, view with ratio bucketed) to reward higher-ranked hits more.
@@ -19,6 +309,7 @@ Online metrics (A/B)
 •	Engagement rate per impression (views+likes+shares+comments / impressions).
 •	Retention / session length — does the recommender increase session length or DAU/WAU?
 •	Creator retention / monetization signals — follows, shares.
+
 Trade-offs & engineering considerations
 •	Freshness vs relevance: boosting freshness helps discovery but can reduce immediate engagement (if fresh items are low-quality). Tune delta (freshness weight) and consider contextual buckets (new-user vs veteran).
 •	Popularity bias vs personalization: heavy global_pop increases short-term engagement and reduces risk (safe), but amplifies popular creators and hurts long-tail discovery. Use hybrid weighting or diversify candidates.
@@ -30,3 +321,64 @@ Practical rollout plan
 1.	Start with the heuristic baseline (this pipeline). Run offline eval & small A/B test (on a small percentage of traffic) vs current system.
 2.	If uplift is promising, iterate with feature engineering and small gradient-boosted model (LightGBM / XGBoost) as re-ranker.
 3.	For large catalogs & scale, implement a Two-Tower retrieval (user/item embeddings) + ANN (FAISS/ScaNN) as retrieval and a learned ranker for final sort. Monitor cost and latency
+
+
+Scalable Architecture (AWS)
+Design goals: Low cost, scalable, simple to operate. Favor managed services, batch retraining, and a lightweight real-time serving tier.
+1) Event collection & storage
+•	Mobile clients → HTTPS → API Gateway.
+•	API Gateway → Lambda (validation + auth) → Kinesis Data Firehose (or Data Streams).
+•	Firehose writes raw events to S3 (Parquet) for durable, cheap storage and audit logs.
+•	For near-real-time aggregation, stream a copy to Kinesis Data Streams (or small MSK) → consumer (Lambda / Kinesis Data Analytics) that writes aggregates to DynamoDB or ElastiCache (Redis).
+2) Training & feature pipelines
+•	Batch ETL: AWS Glue (or Spark on EMR) / Athena jobs read S3 parquet → build training tables (user, item features).
+•	Model training: SageMaker or AWS Batch for heavier models; Glue/Athena + simple Lambda for heuristic baselines.
+•	Retraining cadence: cost-aware defaults: nightly or every 24–72 hours. Maintain an hourly lightweight job that updates popularity/freshness aggregates if needed.
+•	Feature store / serving store: store compact features in DynamoDB (cost-efficient, low latency). Use Redis (Elasticache) only if sub-10ms access and higher cost is justified.
+3) Real-time serving
+•	Request flow: Client → API Gateway → Lambda → fetch candidate list + user features from DynamoDB/Redis → compute ranking (weighted sum or model) in Lambda → return Top-N.
+•	Candidate generation: precompute popular / topical candidate lists and per-user candidate sets in DynamoDB; Lambda re-ranks.
+•	Latency targets: ranking compute 100–200ms; end-to-end < 300ms (account for cold starts). Use provisioned concurrency for critical endpoints if needed.
+4) AWS Personalize vs Custom
+•	Personalize: good for fast CF solution. Send events (impression, view, like, comment, share, follow_creator) + item/user attributes (duration_sec, hashtag, category, country, signup_date, event_value for watch ratio).
+o	Cost control: use batch recommendations, smaller datasets, simpler recipes, less frequent retraining.
+•	Custom (recommended initially): cheaper, more transparent — implement heuristic: score = 0.5*pop + 0.25*creator_aff + 0.15*cat_aff + 0.1*freshness.
+o	Iterate to SageMaker logistic/GBM re-rankers if offline eval justifies cost.
+5) Cost controls & ops tips
+•	Run heavy compute offline and in off-hours (Glue/EMR/SageMaker spot).
+•	Keep feature vectors compact; use DynamoDB with autoscaling or on-demand capacity.
+•	Use S3 + Athena for ad-hoc analytics.
+•	Limit real-time model complexity; use two-stage architecture (cheap retrieval + expensive re-rank only for top candidates).
+•	Monitor cost vs. uplift; delay expensive managed services until clear ROI.
+
+ Dashboard metrics + example SQL
+Key metrics for a “Recommendation System Health” dashboard and example SQL 
+1.	Watch-through rate: fraction of view events with watch_time_ratio >= 0.8.
+SELECT
+  SUM(CASE WHEN event_type='view' AND (watch_time_sec/duration_sec) >= 0.8 THEN 1 ELSE 0 END) *1.0 /
+  SUM(CASE WHEN event_type='view' THEN 1 ELSE 0 END) AS watch_through_rate
+FROM interactions;
+2.	Click/engagement rate per impression (views+likes+shares+comments per impression):
+SELECT
+  SUM(CASE WHEN event_type IN ('view','like','comment','share') THEN 1 ELSE 0 END) *1.0 /
+  SUM(CASE WHEN event_type = 'impression' THEN 1 ELSE 0 END) AS engagement_per_impression
+FROM interactions;
+3.	HitRate@10 (offline): for an offline evaluation table recs(uid, ping_id, rank) and test_interactions, compute fraction of users with at least one high engagement in top 10.
+-- pseudo-SQL, depends on materialized tables
+SELECT AVG(CASE WHEN hit_count > 0 THEN 1 ELSE 0 END) AS hitrate_at_10
+FROM (
+  SELECT r.user_id, COUNT(*) FILTER (WHERE t.event_type IN ('share','comment') OR (t.event_type='view' AND t.watch_time_sec/t.duration_sec>=0.5)) AS hit_count
+  FROM recs r
+  LEFT JOIN test_interactions t ON r.user_id = t.user_id AND r.ping_id = t.ping_id
+  WHERE r.rank <= 10
+  GROUP BY r.user_id
+) s;
+4.	Average time-to-first-engagement after impression (median):
+-- needs sessionization: find impression timestamp and subsequent first view/like by same user/ping
+5.	Item coverage: fraction of items ever recommended / fraction of catalog items:
+SELECT
+  COUNT(DISTINCT ping_id) FILTER (WHERE recommended_flag=1) *1.0 / COUNT(DISTINCT ping_id) AS coverage
+FROM item_table;
+6.	Top failure modes: % of impressions with zero subsequent views within 24 hours:
+-- join impressions with any view event within 24h, count the misses
+
