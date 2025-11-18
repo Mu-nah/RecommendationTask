@@ -1,0 +1,32 @@
+•	Many view events have low watch_time_ratio (median often < 0.5) — suggests frequent skims/swipes; prioritize short hooks or higher early retention.
+•	Items with high global engagement frequently combine many partial/full views and some likes/shares; shares/comments are rare but amplify item score.
+•	New users (signed up in last 7 days) typically have lower absolute number of interactions but sometimes higher watch ratios (onboarding or novelty effect) — consider showing more engaging/popular content early.
+•	If impressions dominate (lots of impressions, few views), feed freshness and strong thumbnails might help lift view rates.
+•	Creator-follow events are valuable signals for personalized ranking (use to bias towards that creator’s content).
+
+
+
+ Short note on metrics & trade-offs
+Primary offline metrics
+•	HitRate@K (Recall@K) — fraction of users for whom Top-K contains an item they actually had a high-engagement event on (view with watch_time_ratio>=0.5, like, share, comment) in the test window. Easy to compute and interpretable.
+•	NDCG@K — uses graded relevance (e.g., share=4, comment=3, like=2, view with ratio bucketed) to reward higher-ranked hits more.
+•	MRR@K — useful if you care about first-hit position.
+•	Coverage & catalog churn — fraction of items recommended at least once; measure recommendation diversity / long-tail exposure.
+•	Novelty / freshness — fraction of recommendations that are new to the user (not previously seen).
+•	Calibration / fairness metrics — check popularity bias and creator exposure; ensure creators get fair impressions.
+Online metrics (A/B)
+•	Watch-through rate (per-recommendation): % of views with watch_time_ratio >= 0.8.
+•	Engagement rate per impression (views+likes+shares+comments / impressions).
+•	Retention / session length — does the recommender increase session length or DAU/WAU?
+•	Creator retention / monetization signals — follows, shares.
+Trade-offs & engineering considerations
+•	Freshness vs relevance: boosting freshness helps discovery but can reduce immediate engagement (if fresh items are low-quality). Tune delta (freshness weight) and consider contextual buckets (new-user vs veteran).
+•	Popularity bias vs personalization: heavy global_pop increases short-term engagement and reduces risk (safe), but amplifies popular creators and hurts long-tail discovery. Use hybrid weighting or diversify candidates.
+•	Explainability vs accuracy: simple linear heuristics are explainable and cheap; advanced models (LightGBM, XGBoost, Transformers) may yield higher offline metrics but require more infra and are harder to debug.
+•	Cold-start: new items and new users need special handling (impression seeding, default popularity, content-based features, or exploration bucket).
+•	Latency vs complexity: heavy ranking models can be used only in the second-stage (re-ranking) — retrieval must remain fast (Two-Tower / ANN index or precomputed candidate sets).
+•	Evaluation temporal split: always use time-based train/test splits (train on past, test on future) to avoid leakage.
+Practical rollout plan
+1.	Start with the heuristic baseline (this pipeline). Run offline eval & small A/B test (on a small percentage of traffic) vs current system.
+2.	If uplift is promising, iterate with feature engineering and small gradient-boosted model (LightGBM / XGBoost) as re-ranker.
+3.	For large catalogs & scale, implement a Two-Tower retrieval (user/item embeddings) + ANN (FAISS/ScaNN) as retrieval and a learned ranker for final sort. Monitor cost and latency
