@@ -14,14 +14,14 @@ Global ping score = sum of (user,ping) engagement scores across all users.
 Rationale 
 Views are a core engagement signal but must be scaled by how much of the video was actually watched — so we use watch_time_ratio. Stronger actions (comment, share) indicate higher intent and should be weighted heavier than likes. Impressions are weak signals and only give a tiny positive contribution (to avoid zeroing out cold-start items). Follow-creator is a strong signal for creator affinity and gets a moderate boost.
 
-Python (pandas) code — full pipeline on pingtop_recs.py
+Python (pandas) code — see full pipeline on pingtop_recs.py
 This single script:
 •	reads users.csv, pings.csv, interactions.csv,
 •	cleans/pads missing durations if needed,
 •	computes watch_time_ratio, event-level event_score, per (user, ping) engagement, global ping score,
 •	prints/saves top-10 pings, watch_time_ratio distribution, new-vs-existing summary,
 •	builds a simple heuristic recommender and outputs Top-10 for 3 example users
-see
+
 
 the output directory will contain:
 •	ping_global.csv (global engagement per ping),
@@ -180,5 +180,6 @@ SELECT
 FROM item_table;
 6.	Top failure modes: % of impressions with zero subsequent views within 24 hours:
 -- join impressions with any view event within 24h, count the misses
+
 
 
